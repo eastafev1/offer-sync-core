@@ -413,6 +413,14 @@ export type Database = {
         }
         Returns: boolean
       }
+      is_product_owner: {
+        Args: { _product_id: string; _user_id: string }
+        Returns: boolean
+      }
+      is_product_owner_by_deal: {
+        Args: { _product_id: string; _user_id: string }
+        Returns: boolean
+      }
     }
     Enums: {
       app_role: "admin" | "seller" | "agent"
