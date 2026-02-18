@@ -46,42 +46,23 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
-      const { data, error } = await supabase.auth.signUp({
+      const { error } = await supabase.auth.signUp({
         email: form.email,
         password: form.password,
-        options: { data: { name: form.name, role: selectedRole } },
+        options: {
+          data: {
+            name: form.name,
+            role: selectedRole,
+            telegram_username: form.telegram_username || '',
+            paypal: form.paypal || '',
+            payment_details: form.payment_details || '',
+            about: form.about || '',
+            recommendations: form.recommendations || '',
+            countries: selectedCountries,
+          },
+        },
       });
       if (error) throw error;
-
-      if (data.user) {
-        // Update profile with extra fields
-        const { error: profErr } = await supabase.from('profiles').upsert({
-          id: data.user.id,
-          name: form.name,
-          email: form.email,
-          telegram_username: form.telegram_username || null,
-          paypal: form.paypal || null,
-          payment_details: form.payment_details || null,
-          about: form.about || null,
-          recommendations: form.recommendations || null,
-          status: 'pending',
-        });
-        if (profErr) throw profErr;
-
-        // Assign role
-        const { error: roleErr } = await supabase.from('user_roles').insert({
-          user_id: data.user.id,
-          role: selectedRole,
-        });
-        if (roleErr) console.warn('Role insert error (may be duplicate):', roleErr);
-
-        // Insert desired countries
-        if (selectedCountries.length > 0) {
-          await supabase.from('user_countries').insert(
-            selectedCountries.map((c) => ({ user_id: data.user!.id, country: c as 'ES' | 'DE' | 'FR' | 'IT' | 'UK' }))
-          );
-        }
-      }
 
       toast({ title: 'Registration submitted!', description: 'An admin will review your account shortly.' });
       navigate('/pending');
