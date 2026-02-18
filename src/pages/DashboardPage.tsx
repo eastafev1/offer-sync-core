@@ -2,13 +2,15 @@ import { useEffect, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
+import { useToast } from '@/hooks/use-toast';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import {
   FileText, Clock, CheckCircle2, DollarSign,
-  Package, BookmarkCheck, TrendingUp, ShieldAlert
+  Package, BookmarkCheck, TrendingUp, ShieldAlert, Download
 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
 interface KpiTile {
   label: string;
@@ -29,9 +31,44 @@ function KpiCard({ tile }: { tile: KpiTile }) {
   );
 }
 
+// ---- CSV export types & helper ----
+interface CommissionRow {
+  id: string;
+  deal_id: string;
+  agent_id: string;
+  agent_name: string;
+  agent_email: string;
+  product_title: string;
+  amount_eur: number;
+  created_at: string;
+}
+
+function exportCommissionsCSV(rows: CommissionRow[]) {
+  const header = ['Agent Name', 'Agent Email', 'Product', 'Commission (€)', 'Deal ID', 'Date'];
+  const lines = rows.map((r) => [
+    `"${r.agent_name.replace(/"/g, '""')}"`,
+    `"${r.agent_email.replace(/"/g, '""')}"`,
+    `"${r.product_title.replace(/"/g, '""')}"`,
+    r.amount_eur.toFixed(2),
+    r.deal_id,
+    new Date(r.created_at).toLocaleDateString('en-GB'),
+  ].join(','));
+  const csv = [header.join(','), ...lines].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `commissions-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export default function DashboardPage() {
   const { isAdmin, isSeller, isAgent, user } = useAuth();
   const { activeCountry } = useOutletContext<{ activeCountry: string | null }>();
+  const { toast } = useToast();
 
   // Admin stats
   const [adminStats, setAdminStats] = useState({
@@ -39,6 +76,7 @@ export default function DashboardPage() {
   });
   const [salesChart, setSalesChart] = useState<{ date: string; deals: number }[]>([]);
   const [salesByCountry, setSalesByCountry] = useState<{ country: string; deals: number; commission: number }[]>([]);
+  const [exportLoading, setExportLoading] = useState(false);
 
   // Agent stats
   const [agentStats, setAgentStats] = useState({ activeHolds: 0, submitted: 0, completed: 0, commission: 0 });
@@ -104,6 +142,53 @@ export default function DashboardPage() {
     setSellerStats({ products: prods.count ?? 0, sales: 0, blocked: 0 });
   }
 
+  async function handleExportCommissions() {
+    setExportLoading(true);
+    try {
+      const { data: credits, error } = await supabase
+        .from('commission_credits')
+        .select('id, deal_id, agent_id, amount_eur, created_at, products(title)')
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      // Fetch agent profiles for names/emails
+      const agentIds = [...new Set((credits ?? []).map((c) => c.agent_id))];
+      const { data: profilesData } = agentIds.length > 0
+        ? await supabase.from('profiles').select('id, name, email').in('id', agentIds)
+        : { data: [] };
+
+      const profileMap = Object.fromEntries((profilesData ?? []).map((p) => [p.id, p]));
+
+      const rows: CommissionRow[] = (credits ?? []).map((c) => {
+        const prof = profileMap[c.agent_id] ?? { name: 'Unknown', email: '' };
+        const product = c.products as { title: string } | null;
+        return {
+          id: c.id,
+          deal_id: c.deal_id,
+          agent_id: c.agent_id,
+          agent_name: prof.name,
+          agent_email: prof.email ?? '',
+          product_title: product?.title ?? '—',
+          amount_eur: Number(c.amount_eur),
+          created_at: c.created_at,
+        };
+      });
+
+      if (rows.length === 0) {
+        toast({ title: 'No commissions to export yet.' });
+        return;
+      }
+
+      exportCommissionsCSV(rows);
+      toast({ title: `Exported ${rows.length} commission records.` });
+    } catch (err: any) {
+      toast({ title: 'Export failed', description: err.message, variant: 'destructive' });
+    } finally {
+      setExportLoading(false);
+    }
+  }
+
   return (
     <div className="p-6 space-y-6 animate-fade-in">
       <div>
@@ -116,11 +201,30 @@ export default function DashboardPage() {
       {/* ADMIN */}
       {isAdmin && (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <KpiCard tile={{ label: 'Total Deals', value: adminStats.total, icon: FileText, color: 'bg-tile-blue' }} />
-            <KpiCard tile={{ label: 'Awaiting Review', value: adminStats.awaiting, icon: ShieldAlert, color: 'bg-tile-orange' }} />
-            <KpiCard tile={{ label: 'Completed', value: adminStats.completed, icon: CheckCircle2, color: 'bg-tile-green' }} />
-            <KpiCard tile={{ label: 'Commission Paid (€)', value: `€${adminStats.commission.toFixed(2)}`, icon: DollarSign, color: 'bg-tile-purple' }} />
+          {/* KPI tiles row + Export button */}
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <KpiCard tile={{ label: 'Total Deals', value: adminStats.total, icon: FileText, color: 'bg-tile-blue' }} />
+              <KpiCard tile={{ label: 'Awaiting Review', value: adminStats.awaiting, icon: ShieldAlert, color: 'bg-tile-orange' }} />
+              <KpiCard tile={{ label: 'Completed', value: adminStats.completed, icon: CheckCircle2, color: 'bg-tile-green' }} />
+              <KpiCard tile={{ label: 'Commission Paid (€)', value: `€${adminStats.commission.toFixed(2)}`, icon: DollarSign, color: 'bg-tile-purple' }} />
+            </div>
+            <div className="flex justify-end">
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-2"
+                disabled={exportLoading}
+                onClick={handleExportCommissions}
+              >
+                {exportLoading ? (
+                  <span className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                Export Commissions CSV
+              </Button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
