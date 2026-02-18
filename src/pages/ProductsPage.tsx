@@ -1,15 +1,15 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useOutletContext, Link } from 'react-router-dom';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Badge } from '@/components/ui/badge';
-import { Plus, Search, ExternalLink, BookmarkPlus, Pencil, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Plus, Search, ExternalLink, BookmarkPlus, Pencil, ChevronLeft, ChevronRight, Clock } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const PAGE_SIZE = 20;
+const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
 interface Product {
   id: string;
@@ -28,8 +28,46 @@ interface Product {
   end_date: string | null;
 }
 
+// Map of productId -> cooldown end timestamp (ms)
+type CooldownMap = Record<string, number>;
+
+/** Live countdown for a single product cooldown */
+function CooldownTimer({ endsAt, onExpired }: { endsAt: number; onExpired: () => void }) {
+  const [remaining, setRemaining] = useState(() => Math.max(0, endsAt - Date.now()));
+  const calledRef = useRef(false);
+
+  useEffect(() => {
+    const tick = () => {
+      const diff = Math.max(0, endsAt - Date.now());
+      setRemaining(diff);
+      if (diff === 0 && !calledRef.current) {
+        calledRef.current = true;
+        onExpired();
+      }
+    };
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [endsAt, onExpired]);
+
+  const mins = Math.floor(remaining / 60000);
+  const secs = Math.floor((remaining % 60000) / 1000);
+
+  return (
+    <div className="flex flex-col items-end gap-0.5">
+      <div className="flex items-center gap-1 text-warning">
+        <Clock className="w-3 h-3" />
+        <span className="font-mono text-xs font-bold tabular-nums">
+          {String(mins).padStart(2, '0')}:{String(secs).padStart(2, '0')}
+        </span>
+      </div>
+      <span className="text-xs text-muted-foreground">cooldown</span>
+    </div>
+  );
+}
+
 export default function ProductsPage() {
-  const { isAdmin, isSeller, user } = useAuth();
+  const { isAdmin, isSeller, isAgent, user } = useAuth();
   const { activeCountry } = useOutletContext<{ activeCountry: string | null }>();
   const { toast } = useToast();
 
@@ -39,6 +77,8 @@ export default function ProductsPage() {
   const [page, setPage] = useState(0);
   const [total, setTotal] = useState(0);
   const [reserving, setReserving] = useState<string | null>(null);
+  // Cooldown map: productId -> expiry timestamp in ms
+  const [cooldowns, setCooldowns] = useState<CooldownMap>({});
 
   const fetchProducts = useCallback(async () => {
     setLoading(true);
@@ -59,25 +99,52 @@ export default function ProductsPage() {
     setLoading(false);
   }, [activeCountry, search, page]);
 
-  useEffect(() => {
-    setPage(0);
-  }, [activeCountry, search]);
+  // Fetch agent's recently expired holds to determine cooldowns
+  const fetchCooldowns = useCallback(async () => {
+    if (!user || isAdmin || isSeller) return;
+    const since = new Date(Date.now() - COOLDOWN_MS).toISOString();
+    const { data } = await supabase
+      .from('holds')
+      .select('product_id, updated_at')
+      .eq('agent_id', user.id)
+      .eq('status', 'expired')
+      .gte('updated_at', since);
 
-  useEffect(() => {
-    fetchProducts();
-  }, [fetchProducts]);
+    if (!data) return;
+    const map: CooldownMap = {};
+    for (const row of data) {
+      const expiry = new Date(row.updated_at).getTime() + COOLDOWN_MS;
+      if (expiry > Date.now()) {
+        // Keep the latest expiry per product
+        if (!map[row.product_id] || expiry > map[row.product_id]) {
+          map[row.product_id] = expiry;
+        }
+      }
+    }
+    setCooldowns(map);
+  }, [user, isAdmin, isSeller]);
+
+  useEffect(() => { setPage(0); }, [activeCountry, search]);
+
+  useEffect(() => { fetchProducts(); }, [fetchProducts]);
+
+  useEffect(() => { fetchCooldowns(); }, [fetchCooldowns]);
 
   async function handleReserve(productId: string) {
     setReserving(productId);
     try {
-      const { data, error } = await supabase.rpc('create_hold', {
+      const { error } = await supabase.rpc('create_hold', {
         p_product_id: productId,
         p_agent_id: user!.id,
       });
       if (error) throw error;
       toast({ title: 'Hold created!', description: 'You have 30 minutes to complete the order.' });
+      // Refresh cooldowns after successful reservation
+      fetchCooldowns();
     } catch (err: any) {
       toast({ title: 'Cannot reserve', description: err.message, variant: 'destructive' });
+      // If server blocked due to cooldown, refresh to sync UI
+      fetchCooldowns();
     } finally {
       setReserving(null);
     }
@@ -92,6 +159,14 @@ export default function ProductsPage() {
     if (p.start_date && new Date(p.start_date) > now) return { label: 'Upcoming', cls: 'badge-pending' };
     return { label: 'Available', cls: 'badge-active' };
   };
+
+  const expireCooldown = useCallback((productId: string) => {
+    setCooldowns((prev) => {
+      const next = { ...prev };
+      delete next[productId];
+      return next;
+    });
+  }, []);
 
   return (
     <div className="p-6 space-y-5 animate-fade-in">
@@ -151,6 +226,9 @@ export default function ProductsPage() {
               ) : (
                 products.map((p) => {
                   const status = getStatus(p);
+                  const cooldownEndsAt = cooldowns[p.id];
+                  const inCooldown = !!cooldownEndsAt && cooldownEndsAt > Date.now();
+
                   return (
                     <tr key={p.id} className="hover:bg-muted/30 transition-colors">
                       <td className="px-4 py-3">
@@ -197,7 +275,15 @@ export default function ProductsPage() {
                               </Button>
                             </Link>
                           )}
-                          {status.label === 'Available' && !isAdmin && !isSeller && (
+                          {/* Cooldown timer — shown to agents only */}
+                          {isAgent && !isAdmin && !isSeller && inCooldown && (
+                            <CooldownTimer
+                              endsAt={cooldownEndsAt}
+                              onExpired={() => expireCooldown(p.id)}
+                            />
+                          )}
+                          {/* Reserve button — only when available and not in cooldown */}
+                          {status.label === 'Available' && isAgent && !isAdmin && !isSeller && !inCooldown && (
                             <Button
                               size="sm"
                               className="h-7 px-3 gap-1 text-xs"
