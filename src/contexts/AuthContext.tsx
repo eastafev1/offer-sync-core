@@ -45,11 +45,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const fetchUserData = async (userId: string) => {
     try {
-      const [profileRes, rolesRes, countriesRes] = await Promise.all([
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('fetchUserData timeout')), 8000)
+      );
+
+      const fetchAll = Promise.all([
         supabase.from('profiles').select('*').eq('id', userId).single(),
         supabase.from('user_roles').select('role').eq('user_id', userId),
         supabase.from('user_countries').select('country').eq('user_id', userId),
       ]);
+
+      const [profileRes, rolesRes, countriesRes] = await Promise.race([fetchAll, timeout]);
 
       if (profileRes.data) setProfile(profileRes.data as UserProfile);
       if (rolesRes.data) setRoles(rolesRes.data.map((r) => r.role as AppRole));
